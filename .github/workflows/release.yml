@@ -9,27 +9,27 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build and Publish
+  # ==========================================
+  # 1. 编译 Linux (全静态 Alpine 方案)
+  # 包含: amd64, arm64, 386, arm
+  # ==========================================
+  build-linux:
+    name: Build Linux
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        # 同时编译 AMD64 (普通服务器) 和 ARM64 (甲骨文云、树莓派等)
-        goarch: [amd64, arm64]
-
+        goarch: [amd64, arm64, 386, arm]
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    # 安装 QEMU 模拟器，这样 Ubuntu 就能运行 ARM64 的 Docker 容器了
+    # 安装 QEMU 以支持 ARM 架构的容器
     - name: Set up QEMU
-      if: matrix.goarch == 'arm64'
+      if: matrix.goarch == 'arm64' || matrix.goarch == 'arm'
       uses: docker/setup-qemu-action@v3
 
     # 拉起 Alpine 容器进行全静态编译
     - name: Build Binary in Alpine
       run: |
-        # --platform 指定拉取对应架构的 Alpine 镜像
         docker run --rm \
           --platform linux/${{ matrix.goarch }} \
           -v ${{ github.workspace }}:/app \
@@ -43,19 +43,108 @@ jobs:
       run: |
         DIR_NAME="NekoIPinfo-linux-${{ matrix.goarch }}"
         mkdir -p $DIR_NAME
-        
-        # 移动刚刚编译出的纯静态二进制文件
         mv neko-ip-api $DIR_NAME/
-        
-        # 拷贝静态资源和文档
         cp -r static db_example README.md $DIR_NAME/
-        
-        # 打包成 ZIP
         zip -r $DIR_NAME.zip $DIR_NAME
 
     - name: Upload Release
       uses: softprops/action-gh-release@v2
       with:
         files: NekoIPinfo-linux-${{ matrix.goarch }}.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # 2. 编译 macOS (Darwin原生环境)
+  # 包含: amd64 (Intel), arm64 (M1/M2/M3)
+  # ==========================================
+  build-darwin:
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        
+    - name: Build Binary
+      env:
+        CGO_ENABLED: 1
+        GOOS: darwin
+        GOARCH: ${{ matrix.goarch }}
+      run: |
+        go build -ldflags="-s -w" -o neko-ip-api main.go
+
+    - name: Package files
+      run: |
+        DIR_NAME="NekoIPinfo-darwin-${{ matrix.goarch }}"
+        mkdir -p $DIR_NAME
+        mv neko-ip-api $DIR_NAME/
+        cp -r static db_example README.md $DIR_NAME/
+        zip -r $DIR_NAME.zip $DIR_NAME
+
+    - name: Upload Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: NekoIPinfo-darwin-${{ matrix.goarch }}.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # 3. 编译 Windows (Ubuntu + MinGW 交叉编译)
+  # 包含: amd64, 386
+  # ==========================================
+  build-windows:
+    name: Build Windows
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        # 为不同架构指定对应的 C 语言交叉编译器
+        include:
+          - goarch: amd64
+            cc: x86_64-w64-mingw32-gcc
+            pkg: gcc-mingw-w64-x86-64
+          - goarch: 386
+            cc: i686-w64-mingw32-gcc
+            pkg: gcc-mingw-w64-i686
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        
+    # 安装 Windows C 交叉编译器 (MinGW)
+    - name: Install MinGW
+      run: sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg }}
+      
+    - name: Build Binary
+      env:
+        CGO_ENABLED: 1
+        GOOS: windows
+        GOARCH: ${{ matrix.goarch }}
+        CC: ${{ matrix.cc }}
+      run: |
+        # 注意 Windows 版本需要加 .exe 后缀
+        go build -ldflags="-s -w" -o neko-ip-api.exe main.go
+
+    - name: Package files
+      run: |
+        DIR_NAME="NekoIPinfo-windows-${{ matrix.goarch }}"
+        mkdir -p $DIR_NAME
+        mv neko-ip-api.exe $DIR_NAME/
+        cp -r static db_example README.md $DIR_NAME/
+        zip -r $DIR_NAME.zip $DIR_NAME
+
+    - name: Upload Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: NekoIPinfo-windows-${{ matrix.goarch }}.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

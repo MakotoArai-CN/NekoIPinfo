@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Chocola-X/NekoIPinfo/internal/codec"
 	"github.com/Chocola-X/NekoIPinfo/internal/model"
 	"github.com/Chocola-X/NekoIPinfo/internal/sysinfo"
 	"github.com/cockroachdb/pebble/v2"
@@ -24,64 +25,98 @@ const (
 )
 
 type cacheEntry struct {
-	json []byte
+	data []byte
 }
 
 type Store struct {
-	PDB        *pebble.DB
-	Rules      []model.CompactRule
-	JsonPool   []byte
-	MemMode    string
-	lruCache   *lru.Cache[uint64, cacheEntry]
-	iterPool   sync.Pool
+	PDB      *pebble.DB
+	Rules    []model.CompactRule
+	DataPool []byte
+	MemMode  string
+	lruCache *lru.Cache[uint64, cacheEntry]
+	iterPool sync.Pool
+
 	activeReqs atomic.Int64
 	stopCh     chan struct{}
 }
 
-func Open(dbPath string, memMode string) (*Store, error) {
+func Open(dbPath string, memMode string, memBudget int64) (*Store, error) {
 	dbSizeMB := sysinfo.DatabaseSizeMB(dbPath)
 	availMB := sysinfo.AvailableMemoryMB()
+	dbSizeBytes := int64(dbSizeMB * 1024 * 1024)
 
-	if memMode == MemModeFull {
-		needMB := uint64(dbSizeMB * 12)
-		if needMB > 0 && availMB > 0 && needMB > availMB {
-			log.Printf("全量内存需要约 %d MB，可用内存 %d MB，降级为 fast 模式", needMB, availMB)
-			memMode = MemModeFast
+	if memBudget > 0 {
+		budgetMB := memBudget / (1024 * 1024)
+		if memMode == MemModeFull {
+			needBytes := dbSizeBytes * 12
+			if needBytes > memBudget {
+				log.Printf("全量内存需要约 %d MB，内存预算 %d MB，降级为 fast 模式", needBytes/(1024*1024), budgetMB)
+				memMode = MemModeFast
+			}
 		}
-	}
-	if memMode == MemModeFast {
-		needMB := uint64(dbSizeMB * 2)
-		if needMB > 0 && availMB > 0 && needMB > availMB {
-			log.Printf("fast 模式需要约 %d MB，可用内存 %d MB，降级为 off 模式", needMB, availMB)
-			memMode = MemModeOff
+		if memMode == MemModeFast {
+			needBytes := dbSizeBytes * 2
+			if needBytes > memBudget {
+				log.Printf("fast 模式需要约 %d MB，内存预算 %d MB，降级为 off 模式", needBytes/(1024*1024), budgetMB)
+				memMode = MemModeOff
+			}
+		}
+	} else {
+		if memMode == MemModeFull {
+			needMB := uint64(dbSizeMB * 12)
+			if needMB > 0 && availMB > 0 && needMB > availMB {
+				log.Printf("全量内存需要约 %d MB，可用内存 %d MB，降级为 fast 模式", needMB, availMB)
+				memMode = MemModeFast
+			}
+		}
+		if memMode == MemModeFast {
+			needMB := uint64(dbSizeMB * 2)
+			if needMB > 0 && availMB > 0 && needMB > availMB {
+				log.Printf("fast 模式需要约 %d MB，可用内存 %d MB，降级为 off 模式", needMB, availMB)
+				memMode = MemModeOff
+			}
 		}
 	}
 
 	var cacheSize int64
-	totalMem := int64(sysinfo.TotalMemoryMB())
-	if totalMem <= 0 {
-		totalMem = 1024
-	}
-	switch memMode {
-	case MemModeFull:
-		cacheSize = 64 << 20
-	case MemModeFast:
-		if totalMem > 2048 {
-			cacheSize = 256 << 20
-		} else if totalMem > 1024 {
-			cacheSize = 128 << 20
-		} else {
-			cacheSize = 64 << 20
+
+	if memBudget > 0 {
+		cacheSize = memBudget * 40 / 100
+		if cacheSize < 4<<20 {
+			cacheSize = 4 << 20
 		}
-	default:
-		if totalMem > 2048 {
-			cacheSize = 256 << 20
-		} else if totalMem > 1024 {
-			cacheSize = 128 << 20
-		} else if totalMem > 512 {
+		if cacheSize > memBudget*60/100 {
+			cacheSize = memBudget * 60 / 100
+		}
+		if cacheSize > 512<<20 {
+			cacheSize = 512 << 20
+		}
+	} else {
+		totalMem := int64(sysinfo.TotalMemoryMB())
+		if totalMem <= 0 {
+			totalMem = 1024
+		}
+		switch memMode {
+		case MemModeFull:
 			cacheSize = 64 << 20
-		} else {
-			cacheSize = 32 << 20
+		case MemModeFast:
+			if totalMem > 2048 {
+				cacheSize = 256 << 20
+			} else if totalMem > 1024 {
+				cacheSize = 128 << 20
+			} else {
+				cacheSize = 64 << 20
+			}
+		default:
+			if totalMem > 2048 {
+				cacheSize = 256 << 20
+			} else if totalMem > 1024 {
+				cacheSize = 128 << 20
+			} else if totalMem > 512 {
+				cacheSize = 64 << 20
+			} else {
+				cacheSize = 32 << 20
+			}
 		}
 	}
 
@@ -126,12 +161,22 @@ func Open(dbPath string, memMode string) (*Store, error) {
 			return nil, err
 		}
 		lruSize := 100000
-		if availMB > 2048 {
-			lruSize = 500000
-		} else if availMB > 1024 {
-			lruSize = 200000
-		} else if availMB < 512 {
-			lruSize = 50000
+		if memBudget > 0 {
+			lruSize = int(memBudget / (1024 * 4))
+			if lruSize < 1000 {
+				lruSize = 1000
+			}
+			if lruSize > 500000 {
+				lruSize = 500000
+			}
+		} else {
+			if availMB > 2048 {
+				lruSize = 500000
+			} else if availMB > 1024 {
+				lruSize = 200000
+			} else if availMB < 512 {
+				lruSize = 50000
+			}
 		}
 		s.lruCache, err = lru.New[uint64, cacheEntry](lruSize)
 		if err != nil {
@@ -226,6 +271,14 @@ func (s *Store) searchRules(ipHi, ipLo uint64) *model.CompactRule {
 	return nil
 }
 
+func decodePayload(raw []byte) []byte {
+	r, err := codec.DecodeAuto(raw)
+	if err != nil {
+		return raw
+	}
+	return codec.ToJSON(r)
+}
+
 func (s *Store) loadFullToMemory() error {
 	log.Println("正在将数据库全量载入内存，请稍候喵...")
 	startTime := time.Now()
@@ -237,7 +290,7 @@ func (s *Store) loadFullToMemory() error {
 	defer iter.Close()
 
 	rules := make([]model.CompactRule, 0, 1<<20)
-	jsonPool := make([]byte, 0, 128<<20)
+	dataPool := make([]byte, 0, 128<<20)
 
 	for valid := iter.First(); valid; valid = iter.Next() {
 		keyBytes := iter.Key()
@@ -248,11 +301,16 @@ func (s *Store) loadFullToMemory() error {
 		if len(keyBytes) != 16 || len(valBytes) < 16 {
 			continue
 		}
+
 		startHi, startLo := decodeIP128(keyBytes)
 		endHi, endLo := decodeIP128(valBytes[:16])
-		jsonData := valBytes[16:]
-		offset := uint32(len(jsonPool))
-		jsonPool = append(jsonPool, jsonData...)
+		payload := valBytes[16:]
+
+		jsonData := decodePayload(payload)
+
+		offset := uint32(len(dataPool))
+		dataPool = append(dataPool, jsonData...)
+
 		rules = append(rules, model.CompactRule{
 			StartHi:    startHi,
 			StartLo:    startLo,
@@ -264,10 +322,11 @@ func (s *Store) loadFullToMemory() error {
 	}
 
 	s.Rules = rules
-	s.JsonPool = jsonPool
+	s.DataPool = dataPool
 
-	log.Printf("全量载入完成！共 %d 条规则，JSON池 %.2f MB，耗时 %v 喵！",
-		len(s.Rules), float64(len(s.JsonPool))/(1024*1024), time.Since(startTime))
+	log.Printf("全量载入完成！共 %d 条规则，数据池 %.2f MB，耗时 %v 喵！",
+		len(s.Rules), float64(len(s.DataPool))/(1024*1024), time.Since(startTime))
+
 	return nil
 }
 
@@ -282,6 +341,7 @@ func (s *Store) loadIndexToMemory() error {
 	defer iter.Close()
 
 	rules := make([]model.CompactRule, 0, 1<<20)
+
 	for valid := iter.First(); valid; valid = iter.Next() {
 		keyBytes := iter.Key()
 		valBytes, err := iter.ValueAndErr()
@@ -291,8 +351,10 @@ func (s *Store) loadIndexToMemory() error {
 		if len(keyBytes) != 16 || len(valBytes) < 16 {
 			continue
 		}
+
 		startHi, startLo := decodeIP128(keyBytes)
 		endHi, endLo := decodeIP128(valBytes[:16])
+
 		rules = append(rules, model.CompactRule{
 			StartHi: startHi,
 			StartLo: startLo,
@@ -302,8 +364,10 @@ func (s *Store) loadIndexToMemory() error {
 	}
 
 	s.Rules = rules
+
 	log.Printf("索引载入完成！共 %d 条规则，耗时 %v 喵！",
 		len(s.Rules), time.Since(startTime))
+
 	return nil
 }
 
@@ -313,7 +377,7 @@ func (s *Store) LookupFull(ipHi, ipLo uint64) ([]byte, bool) {
 
 	rule := s.searchRules(ipHi, ipLo)
 	if rule != nil {
-		return s.JsonPool[rule.JsonOffset : rule.JsonOffset+rule.JsonLen], true
+		return s.DataPool[rule.JsonOffset : rule.JsonOffset+rule.JsonLen], true
 	}
 	return nil, false
 }
@@ -330,29 +394,37 @@ func (s *Store) LookupFast(ipHi, ipLo uint64) ([]byte, bool) {
 	if rule == nil {
 		return nil, false
 	}
+
 	ck := makeCacheKey(rule.StartHi, rule.StartLo)
 	if s.lruCache != nil {
 		if entry, ok := s.lruCache.Get(ck); ok {
-			return entry.json, true
+			return entry.data, true
 		}
 	}
+
 	var key [16]byte
 	binary.BigEndian.PutUint64(key[:8], rule.StartHi)
 	binary.BigEndian.PutUint64(key[8:], rule.StartLo)
+
 	val, closer, err := s.PDB.Get(key[:])
 	if err != nil {
 		return nil, false
 	}
 	defer closer.Close()
+
 	if len(val) < 16 {
 		return nil, false
 	}
-	result := make([]byte, len(val)-16)
-	copy(result, val[16:])
+
+	result := decodePayload(val[16:])
+	resultCopy := make([]byte, len(result))
+	copy(resultCopy, result)
+
 	if s.lruCache != nil {
-		s.lruCache.Add(ck, cacheEntry{json: result})
+		s.lruCache.Add(ck, cacheEntry{data: resultCopy})
 	}
-	return result, true
+
+	return resultCopy, true
 }
 
 func (s *Store) LookupPebble(ipHi, ipLo uint64) ([]byte, error) {
@@ -400,6 +472,7 @@ func (s *Store) LookupPebble(ipHi, ipLo uint64) ([]byte, error) {
 		returnIter()
 		return nil, nil
 	}
+
 	kHi, kLo := decodeIP128(keyBytes)
 	if ip128Greater(kHi, kLo, ipHi, ipLo) {
 		returnIter()
@@ -411,19 +484,23 @@ func (s *Store) LookupPebble(ipHi, ipLo uint64) ([]byte, error) {
 		returnIter()
 		return nil, err
 	}
+
 	if len(valBytes) < 16 {
 		returnIter()
 		return nil, nil
 	}
 
 	endHi, endLo := decodeIP128(valBytes[:16])
+
 	if ip128Greater(ipHi, ipLo, endHi, endLo) {
 		returnIter()
 		return nil, nil
 	}
 
-	result := make([]byte, len(valBytes)-16)
-	copy(result, valBytes[16:])
+	result := decodePayload(valBytes[16:])
+	resultCopy := make([]byte, len(result))
+	copy(resultCopy, result)
+
 	returnIter()
-	return result, nil
+	return resultCopy, nil
 }

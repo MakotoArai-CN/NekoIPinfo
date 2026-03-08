@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 
-	json "github.com/goccy/go-json"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -119,12 +118,11 @@ func DumpToCSV(dbPath, outputPath string) (int64, error) {
 
 		startHi, startLo := binary.BigEndian.Uint64(keyBytes[:8]), binary.BigEndian.Uint64(keyBytes[8:16])
 		endHi, endLo := binary.BigEndian.Uint64(valBytes[:8]), binary.BigEndian.Uint64(valBytes[8:16])
-
 		startIP := ip128ToIP(startHi, startLo)
 		endIP := ip128ToIP(endHi, endLo)
 
-		var info IPInfoFields
-		if err := json.Unmarshal(valBytes[16:], &info); err != nil {
+		info, decErr := DecodePayload(valBytes[16:])
+		if decErr != nil {
 			continue
 		}
 
@@ -151,6 +149,7 @@ func DumpToCSV(dbPath, outputPath string) (int64, error) {
 
 	bar.SetCurrent(count)
 	bar.Finish()
+
 	return count, nil
 }
 
@@ -246,8 +245,8 @@ func DumpToSQLite(dbPath, outputPath string) (int64, error) {
 			continue
 		}
 
-		var info IPInfoFields
-		if err := json.Unmarshal(valBytes[16:], &info); err != nil {
+		info, decErr := DecodePayload(valBytes[16:])
+		if decErr != nil {
 			continue
 		}
 
@@ -257,6 +256,7 @@ func DumpToSQLite(dbPath, outputPath string) (int64, error) {
 		if isIPv4Mapped(keyBytes) {
 			startU32 := ipv4ToUint32(keyBytes)
 			endU32 := ipv4ToUint32(valBytes)
+
 			_, err = stmtV4.Exec(
 				int64(startU32), int64(endU32),
 				info.Country, info.Province, info.City, info.ISP,
@@ -267,6 +267,7 @@ func DumpToSQLite(dbPath, outputPath string) (int64, error) {
 			startLo := int64(binary.BigEndian.Uint64(keyBytes[8:16]))
 			endHi := int64(binary.BigEndian.Uint64(valBytes[:8]))
 			endLo := int64(binary.BigEndian.Uint64(valBytes[8:16]))
+
 			_, err = stmtV6.Exec(
 				startHi, startLo, endHi, endLo,
 				info.Country, info.Province, info.City, info.ISP,
@@ -282,20 +283,24 @@ func DumpToSQLite(dbPath, outputPath string) (int64, error) {
 		count++
 		if count%batchLimit == 0 {
 			bar.SetCurrent(count)
+
 			stmtV4.Close()
 			stmtV6.Close()
 			if err := tx.Commit(); err != nil {
 				return count, fmt.Errorf("提交事务失败: %v", err)
 			}
+
 			tx, err = sqlDB.Begin()
 			if err != nil {
 				return count, fmt.Errorf("开始事务失败: %v", err)
 			}
+
 			stmtV4, err = tx.Prepare(`INSERT INTO ip_info (network_start, network_end, country, province, city, isp, latitude, longitude) VALUES (?,?,?,?,?,?,?,?)`)
 			if err != nil {
 				tx.Rollback()
 				return count, fmt.Errorf("准备 IPv4 语句失败: %v", err)
 			}
+
 			stmtV6, err = tx.Prepare(`INSERT INTO ip_info_v6 (network_start_hi, network_start_lo, network_end_hi, network_end_lo, country, province, city, isp, latitude, longitude) VALUES (?,?,?,?,?,?,?,?,?,?)`)
 			if err != nil {
 				tx.Rollback()
@@ -331,39 +336,6 @@ func parseFloat(s string) float64 {
 	return v
 }
 
-func compactIPInfoJSON(raw []byte) string {
-	var info IPInfoFields
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return string(raw)
-	}
-
-	m := make(map[string]string, 6)
-	if info.Country != "" {
-		m["country"] = info.Country
-	}
-	if info.Province != "" {
-		m["province"] = info.Province
-	}
-	if info.City != "" {
-		m["city"] = info.City
-	}
-	if info.ISP != "" {
-		m["isp"] = info.ISP
-	}
-	if info.Latitude != "" {
-		m["latitude"] = info.Latitude
-	}
-	if info.Longitude != "" {
-		m["longitude"] = info.Longitude
-	}
-
-	out, err := json.Marshal(m)
-	if err != nil {
-		return string(raw)
-	}
-	return string(out)
-}
-
 func DumpStats(dbPath string) error {
 	pdb, err := OpenPebbleReadOnly(dbPath)
 	if err != nil {
@@ -378,7 +350,7 @@ func DumpStats(dbPath string) error {
 	defer iter.Close()
 
 	var totalRecords int64
-	var totalJsonBytes int64
+	var totalPayloadBytes int64
 	var ipv4Count int64
 	var ipv6Count int64
 
@@ -390,7 +362,7 @@ func DumpStats(dbPath string) error {
 		}
 
 		totalRecords++
-		totalJsonBytes += int64(len(valBytes) - 16)
+		totalPayloadBytes += int64(len(valBytes) - 16)
 
 		if isIPv4Mapped(keyBytes) {
 			ipv4Count++
@@ -403,7 +375,7 @@ func DumpStats(dbPath string) error {
 	Neko(fmt.Sprintf(" 总记录数: %d", totalRecords), ColorPink)
 	Neko(fmt.Sprintf(" IPv4 记录: %d", ipv4Count), ColorPink)
 	Neko(fmt.Sprintf(" IPv6 记录: %d", ipv6Count), ColorPink)
-	Neko(fmt.Sprintf(" JSON 数据量: %.2f MB", float64(totalJsonBytes)/1024/1024), ColorPink)
+	Neko(fmt.Sprintf(" 数据负载量: %.2f MB", float64(totalPayloadBytes)/1024/1024), ColorPink)
 	PrintDBSize(dbPath)
 	NekoFooter()
 
@@ -435,13 +407,11 @@ func DumpSample(dbPath string, limit int) error {
 
 		startHi, startLo := binary.BigEndian.Uint64(keyBytes[:8]), binary.BigEndian.Uint64(keyBytes[8:16])
 		endHi, endLo := binary.BigEndian.Uint64(valBytes[:8]), binary.BigEndian.Uint64(valBytes[8:16])
-
 		startIP := ip128ToIP(startHi, startLo)
 		endIP := ip128ToIP(endHi, endLo)
 
 		Neko(fmt.Sprintf(" [%d] %s ~ %s", count+1, formatIP(startIP), formatIP(endIP)), ColorMagenta)
-		fmt.Printf("     %s\n", string(valBytes[16:]))
-
+		fmt.Printf("  %s\n", PayloadToJSONString(valBytes[16:]))
 		count++
 	}
 

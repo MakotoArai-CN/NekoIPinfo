@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/Chocola-X/NekoIPinfo/internal/codec"
 	json "github.com/goccy/go-json"
 )
 
@@ -12,9 +13,11 @@ const (
 	DefaultDBPath       = "ip_info"
 	DefaultBackupDir    = "ip_info_backup"
 	DefaultChangelogDir = "ip_info_changelog"
+
 	DbipCityURLTemplate = "https://download.db-ip.com/free/dbip-city-lite-%s.mmdb.gz"
 	DbipASNURLTemplate  = "https://download.db-ip.com/free/dbip-asn-lite-%s.mmdb.gz"
-	BatchSize           = 50000
+
+	BatchSize = 50000
 )
 
 type IPInfoFields struct {
@@ -109,15 +112,44 @@ func MakeKey(ip net.IP) [16]byte {
 	return key
 }
 
-func MakeValue(endIP net.IP, jsonBytes []byte) []byte {
+func MakeValue(endIP net.IP, payload []byte) []byte {
 	end16 := endIP.To16()
 	if end16 == nil {
 		return nil
 	}
-	val := make([]byte, 16+len(jsonBytes))
+	val := make([]byte, 16+len(payload))
 	copy(val[:16], end16)
-	copy(val[16:], jsonBytes)
+	copy(val[16:], payload)
 	return val
+}
+
+func MakeValueFromRecord(endIP net.IP, r *codec.IPInfoRecord) []byte {
+	encoded := codec.Encode(r)
+	return MakeValue(endIP, encoded)
+}
+
+func FieldsToRecord(f *IPInfoFields) *codec.IPInfoRecord {
+	return codec.RecordFromFields(f.Country, f.Province, f.City, f.ISP, f.Latitude, f.Longitude)
+}
+
+func EncodeFields(f *IPInfoFields) []byte {
+	r := FieldsToRecord(f)
+	return codec.Encode(r)
+}
+
+func DecodePayload(data []byte) (*IPInfoFields, error) {
+	r, err := codec.DecodeAuto(data)
+	if err != nil {
+		return nil, err
+	}
+	return &IPInfoFields{
+		Country:   r.Country,
+		Province:  r.Province,
+		City:      r.City,
+		ISP:       r.ISP,
+		Latitude:  codec.FormatFloat32Str(r.Latitude),
+		Longitude: codec.FormatFloat32Str(r.Longitude),
+	}, nil
 }
 
 func LookupASN(asnDB interface{ Lookup(net.IP, interface{}) error }, ip net.IP) string {
@@ -141,10 +173,83 @@ func LookupASN(asnDB interface{ Lookup(net.IP, interface{}) error }, ip net.IP) 
 	return ""
 }
 
-func MergeFields(existingJSON, newJSON []byte, fieldsToUpdate []string) ([]byte, bool) {
+func MergeFields(existingPayload, newPayload []byte, fieldsToUpdate []string) ([]byte, bool) {
+	existing, err1 := DecodePayload(existingPayload)
+	incoming, err2 := DecodePayload(newPayload)
+	if err1 != nil {
+		return newPayload, true
+	}
+	if err2 != nil {
+		return existingPayload, false
+	}
+
+	changed := false
+	for _, field := range fieldsToUpdate {
+		switch field {
+		case "country":
+			if incoming.Country != "" && incoming.Country != existing.Country {
+				existing.Country = incoming.Country
+				changed = true
+			}
+		case "province":
+			if incoming.Province != "" && incoming.Province != existing.Province {
+				existing.Province = incoming.Province
+				changed = true
+			}
+		case "city":
+			if incoming.City != "" && incoming.City != existing.City {
+				existing.City = incoming.City
+				changed = true
+			}
+		case "isp":
+			if incoming.ISP != "" && incoming.ISP != existing.ISP {
+				existing.ISP = incoming.ISP
+				changed = true
+			}
+		case "latitude":
+			if incoming.Latitude != "" && incoming.Latitude != existing.Latitude {
+				existing.Latitude = incoming.Latitude
+				changed = true
+			}
+		case "longitude":
+			if incoming.Longitude != "" && incoming.Longitude != existing.Longitude {
+				existing.Longitude = incoming.Longitude
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return existingPayload, false
+	}
+
+	merged := EncodeFields(existing)
+	return merged, true
+}
+
+func PayloadToJSON(data []byte) []byte {
+	r, err := codec.DecodeAuto(data)
+	if err != nil {
+		return data
+	}
+	return codec.ToJSON(r)
+}
+
+func PayloadToJSONString(data []byte) string {
+	return string(PayloadToJSON(data))
+}
+
+func JSONToPayload(jsonData []byte) []byte {
+	encoded, err := codec.EncodeFromJSON(jsonData)
+	if err != nil {
+		return jsonData
+	}
+	return encoded
+}
+
+func MergeFieldsJSON(existingJSON, newJSON []byte, fieldsToUpdate []string) ([]byte, bool) {
 	var existing IPInfoFields
 	var incoming IPInfoFields
-
 	if err := json.Unmarshal(existingJSON, &existing); err != nil {
 		return newJSON, true
 	}
@@ -191,6 +296,7 @@ func MergeFields(existingJSON, newJSON []byte, fieldsToUpdate []string) ([]byte,
 	if !changed {
 		return existingJSON, false
 	}
+
 	merged, err := json.Marshal(existing)
 	if err != nil {
 		return existingJSON, false

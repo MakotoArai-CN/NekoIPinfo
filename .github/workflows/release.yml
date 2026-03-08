@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with: { fetch-depth: 0 }
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -27,75 +28,138 @@ jobs:
 
     - name: Build all targets
       run: |
-        BUILD="dist"
+        BUILD="release"
         APP="nekoipinfo"
         BENCH="nekoipinfo-bench"
         DBGEN="nekoipinfo-dbgen"
-        FLAGS="-trimpath -ldflags=-s -w"
 
         build_one() {
-          local GOOS=$1 GOARCH=$2 ARCH_NAME=$3 SUFFIX=$4 OS_DIR=$5
-          echo "  ${GOOS}/${GOARCH} -> ${OS_DIR}/${APP}_${ARCH_NAME}${SUFFIX}"
-          DIR="${BUILD}/${OS_DIR}"
-          mkdir -p "$DIR"
-          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "${DIR}/${APP}_${ARCH_NAME}${SUFFIX}" ./cmd
-          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "${DIR}/${BENCH}_${ARCH_NAME}${SUFFIX}" ./cmd/bench
-          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "${DIR}/${DBGEN}_${ARCH_NAME}${SUFFIX}" ./cmd/dbgen
+          local GOOS=$1 GOARCH=$2 ARCH_NAME=$3 SUFFIX=$4
+          mkdir -p "$BUILD"
+          echo "  ${GOOS}/${GOARCH} -> ${APP}_${GOOS}_${ARCH_NAME}${SUFFIX}"
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "${BUILD}/${APP}_${GOOS}_${ARCH_NAME}${SUFFIX}" ./cmd
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "${BUILD}/${BENCH}_${GOOS}_${ARCH_NAME}${SUFFIX}" ./cmd/bench
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "${BUILD}/${DBGEN}_${GOOS}_${ARCH_NAME}${SUFFIX}" ./cmd/dbgen
         }
 
         echo "=========================================="
         echo " Linux"
         echo "=========================================="
-        build_one linux   amd64    x86_64    "" "Linux"
-        build_one linux   386      x86       "" "Linux"
-        build_one linux   arm64    arm64     "" "Linux"
-        build_one linux   arm      arm       "" "Linux"
-        build_one linux   mips     mips      "" "Linux"
-        build_one linux   mipsle   mipsle    "" "Linux"
-        build_one linux   mips64   mips64    "" "Linux"
-        build_one linux   mips64le mips64le  "" "Linux"
-        build_one linux   loong64  loong64   "" "Linux"
-        build_one linux   riscv64  riscv64   "" "Linux"
-        build_one linux   ppc64    ppc64     "" "Linux"
-        build_one linux   ppc64le  ppc64le   "" "Linux"
-        build_one linux   s390x    s390x     "" "Linux"
+        build_one linux   amd64    x86_64    ""
+        build_one linux   386      x86       ""
+        build_one linux   arm64    arm64     ""
+        build_one linux   arm      arm       ""
+        build_one linux   mips     mips      ""
+        build_one linux   mipsle   mipsle    ""
+        build_one linux   mips64   mips64    ""
+        build_one linux   mips64le mips64le  ""
+        build_one linux   loong64  loong64   ""
+        build_one linux   riscv64  riscv64   ""
+        build_one linux   ppc64    ppc64     ""
+        build_one linux   ppc64le  ppc64le   ""
+        build_one linux   s390x    s390x     ""
 
         echo "=========================================="
         echo " macOS"
         echo "=========================================="
-        build_one darwin  amd64    x86_64    "" "macOS"
-        build_one darwin  arm64    arm64     "" "macOS"
+        build_one darwin  amd64    x86_64    ""
+        build_one darwin  arm64    arm64     ""
 
         echo "=========================================="
         echo " Windows"
         echo "=========================================="
-        build_one windows amd64    x86_64    ".exe" "Windows"
-        build_one windows 386      x86       ".exe" "Windows"
-        build_one windows arm64    arm64     ".exe" "Windows"
+        build_one windows amd64    x86_64    ".exe"
+        build_one windows 386      x86       ".exe"
+        build_one windows arm64    arm64     ".exe"
 
-    - name: Package releases
+        ls -lah release/
+
+    - name: Generate changelog
+      id: cl
       run: |
-        cd dist
+        TAG="${GITHUB_REF#refs/tags/}"
+        REPO="${{ github.repository }}"
+        BASE="https://github.com/${REPO}/releases/download/${TAG}"
 
-        cp -r ../static .
-        cp ../README.md .
-        cp ../LICENSE .
+        PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        if [ -z "$PREV" ]; then
+          COMMITS=$(git log --oneline --pretty=format:"- %s (%h)" | head -50)
+        else
+          COMMITS=$(git log ${PREV}..HEAD --oneline --pretty=format:"- %s (%h)")
+        fi
 
-        echo "Packaging Linux..."
-        zip -r NekoIPinfo-Linux.zip Linux/ static/ README.md LICENSE
+        badge_link() {
+          echo "[![${1}](https://img.shields.io/badge/${2}-${3}-${4}?style=for-the-badge&logo=${5}&logoColor=${6})](${BASE}/${7})"
+        }
 
-        echo "Packaging macOS..."
-        zip -r NekoIPinfo-macOS.zip macOS/ static/ README.md LICENSE
+        download_badge() {
+          echo "[![${1}](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-${1}-blue?style=flat-square&logo=download&logoColor=white)](${BASE}/${2})"
+        }
 
-        echo "Packaging Windows..."
-        zip -r NekoIPinfo-Windows.zip Windows/ static/ README.md LICENSE
+        # $1=系统名 $2=logo $3=颜色 $4=logoColor $5=架构标签 $6=app文件 $7=dbgen文件 $8=bench文件 $9=描述
+        row() {
+          local os_badge=$(badge_link "${1} ${5}" "${1}" "${5}" "${3}" "${2}" "${4}" "${6}")
+          local app_dl=$(download_badge "服务本体" "${6}")
+          local dbgen_dl=$(download_badge "数据库工具" "${7}")
+          local bench_dl=$(download_badge "压测工具" "${8}")
+          echo "| ${os_badge} | ${app_dl} | ${dbgen_dl} | ${bench_dl} | ${9} |"
+        }
 
-    - name: Upload Release Assets
+        {
+          echo "CHANGELOG<<EOF"
+          echo "## 更新日志"
+          echo ""
+          echo "$COMMITS"
+          echo ""
+          echo "---"
+          echo ""
+          echo "## 📦 下载"
+          echo ""
+          echo "### 🐧 Linux"
+          echo ""
+          echo "| 系统 / 架构 | 服务本体 | 数据库管理工具 | 压力测试工具 | 说明 |"
+          echo "|:----------:|:-------:|:------------:|:----------:|:-----|"
+          row "Linux" "linux" "FCC624" "black" "x86__64"   "nekoipinfo_linux_x86_64"   "nekoipinfo-dbgen_linux_x86_64"   "nekoipinfo-bench_linux_x86_64"   "主流服务器、VPS"
+          row "Linux" "linux" "FCC624" "black" "x86"       "nekoipinfo_linux_x86"      "nekoipinfo-dbgen_linux_x86"      "nekoipinfo-bench_linux_x86"      "32 位旧服务器"
+          row "Linux" "linux" "FCC624" "black" "arm64"     "nekoipinfo_linux_arm64"    "nekoipinfo-dbgen_linux_arm64"    "nekoipinfo-bench_linux_arm64"    "ARM 服务器、树莓派 4+"
+          row "Linux" "linux" "FCC624" "black" "arm"       "nekoipinfo_linux_arm"      "nekoipinfo-dbgen_linux_arm"      "nekoipinfo-bench_linux_arm"      "树莓派 3 及更早、嵌入式"
+          row "Linux" "linux" "FCC624" "black" "mips"      "nekoipinfo_linux_mips"     "nekoipinfo-dbgen_linux_mips"     "nekoipinfo-bench_linux_mips"     "路由器（大端）"
+          row "Linux" "linux" "FCC624" "black" "mipsle"    "nekoipinfo_linux_mipsle"   "nekoipinfo-dbgen_linux_mipsle"   "nekoipinfo-bench_linux_mipsle"   "路由器（小端）"
+          row "Linux" "linux" "FCC624" "black" "mips64"    "nekoipinfo_linux_mips64"   "nekoipinfo-dbgen_linux_mips64"   "nekoipinfo-bench_linux_mips64"   "64 位 MIPS 设备"
+          row "Linux" "linux" "FCC624" "black" "mips64le"  "nekoipinfo_linux_mips64le" "nekoipinfo-dbgen_linux_mips64le" "nekoipinfo-bench_linux_mips64le" "64 位 MIPS（小端）"
+          row "Linux" "linux" "FCC624" "black" "loong64"   "nekoipinfo_linux_loong64"  "nekoipinfo-dbgen_linux_loong64"  "nekoipinfo-bench_linux_loong64"  "龙芯 3A5000+"
+          row "Linux" "linux" "FCC624" "black" "riscv64"   "nekoipinfo_linux_riscv64"  "nekoipinfo-dbgen_linux_riscv64"  "nekoipinfo-bench_linux_riscv64"  "RISC-V 64 开发板"
+          row "Linux" "linux" "FCC624" "black" "ppc64"     "nekoipinfo_linux_ppc64"    "nekoipinfo-dbgen_linux_ppc64"    "nekoipinfo-bench_linux_ppc64"    "IBM POWER（大端）"
+          row "Linux" "linux" "FCC624" "black" "ppc64le"   "nekoipinfo_linux_ppc64le"  "nekoipinfo-dbgen_linux_ppc64le"  "nekoipinfo-bench_linux_ppc64le"  "IBM POWER（小端）"
+          row "Linux" "linux" "FCC624" "black" "s390x"     "nekoipinfo_linux_s390x"    "nekoipinfo-dbgen_linux_s390x"    "nekoipinfo-bench_linux_s390x"    "IBM Z 系列大型机"
+          echo ""
+          echo "### 🍎 macOS"
+          echo ""
+          echo "| 系统 / 架构 | 服务本体 | 数据库管理工具 | 压力测试工具 | 说明 |"
+          echo "|:----------:|:-------:|:------------:|:----------:|:-----|"
+          row "macOS" "apple" "000000" "white" "Intel"           "nekoipinfo_darwin_x86_64" "nekoipinfo-dbgen_darwin_x86_64" "nekoipinfo-bench_darwin_x86_64" "Intel 芯片 Mac"
+          row "macOS" "apple" "000000" "white" "Apple%20Silicon" "nekoipinfo_darwin_arm64"  "nekoipinfo-dbgen_darwin_arm64"  "nekoipinfo-bench_darwin_arm64"  "M1 / M2 / M3 / M4 芯片 Mac"
+          echo ""
+          echo "### 🪟 Windows"
+          echo ""
+          echo "| 系统 / 架构 | 服务本体 | 数据库管理工具 | 压力测试工具 | 说明 |"
+          echo "|:----------:|:-------:|:------------:|:----------:|:-----|"
+          row "Windows" "windows" "0078D6" "white" "x86__64" "nekoipinfo_windows_x86_64.exe" "nekoipinfo-dbgen_windows_x86_64.exe" "nekoipinfo-bench_windows_x86_64.exe" "主流 64 位 Windows"
+          row "Windows" "windows" "0078D6" "white" "x86"     "nekoipinfo_windows_x86.exe"    "nekoipinfo-dbgen_windows_x86.exe"    "nekoipinfo-bench_windows_x86.exe"    "32 位 Windows"
+          row "Windows" "windows" "0078D6" "white" "arm64"   "nekoipinfo_windows_arm64.exe"  "nekoipinfo-dbgen_windows_arm64.exe"  "nekoipinfo-bench_windows_arm64.exe"  "ARM Windows 设备"
+          echo ""
+          echo "---"
+          echo ""
+          echo "> 💡 **Linux/macOS**: 下载后需 \`chmod +x nekoipinfo_*\` 添加执行权限 | **Windows**: 下载即用"
+          echo "> "
+          echo "> 📖 详细用法见 [README](https://github.com/${REPO}#readme)"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+    - name: Release
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          dist/NekoIPinfo-Linux.zip
-          dist/NekoIPinfo-macOS.zip
-          dist/NekoIPinfo-Windows.zip
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: Release ${{ github.ref_name }}
+        body: ${{ steps.cl.outputs.CHANGELOG }}
+        files: release/*
+        make_latest: true

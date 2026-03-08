@@ -19,7 +19,7 @@ import (
 	maxminddb "github.com/oschwald/maxminddb-golang"
 )
 
-func writeOrUpdate(pdb *pebble.DB, clDB *pebble.DB, batch *pebble.Batch, startIP, endIP net.IP, jsonBytes []byte, isUpdate bool, overwriteFlag bool, fieldsToUpdate []string) (written bool, err error) {
+func writeOrUpdate(pdb *pebble.DB, clDB *pebble.DB, batch *pebble.Batch, startIP, endIP net.IP, payload []byte, isUpdate bool, overwriteFlag bool, fieldsToUpdate []string) (written bool, err error) {
 	start16 := startIP.To16()
 	end16 := endIP.To16()
 	if start16 == nil || end16 == nil {
@@ -29,7 +29,7 @@ func writeOrUpdate(pdb *pebble.DB, clDB *pebble.DB, batch *pebble.Batch, startIP
 	key := MakeKey(startIP)
 
 	if !isUpdate {
-		val := MakeValue(endIP, jsonBytes)
+		val := MakeValue(endIP, payload)
 		if val == nil {
 			return false, fmt.Errorf("invalid end IP")
 		}
@@ -38,40 +38,40 @@ func writeOrUpdate(pdb *pebble.DB, clDB *pebble.DB, batch *pebble.Batch, startIP
 
 	existing, closer, getErr := pdb.Get(key[:])
 	if getErr != nil {
-		val := MakeValue(endIP, jsonBytes)
+		val := MakeValue(endIP, payload)
 		if val == nil {
 			return false, fmt.Errorf("invalid end IP")
 		}
-		RecordChange(clDB, key, "insert", nil, jsonBytes)
+		RecordChange(clDB, key, "insert", nil, PayloadToJSON(payload))
 		return true, batch.Set(key[:], val, nil)
 	}
 	defer closer.Close()
 
 	if len(existing) < 16 {
-		val := MakeValue(endIP, jsonBytes)
+		val := MakeValue(endIP, payload)
 		if val == nil {
 			return false, fmt.Errorf("invalid end IP")
 		}
-		RecordChange(clDB, key, "insert", nil, jsonBytes)
+		RecordChange(clDB, key, "insert", nil, PayloadToJSON(payload))
 		return true, batch.Set(key[:], val, nil)
 	}
 
-	existingJSON := existing[16:]
+	existingPayload := existing[16:]
 
 	if overwriteFlag {
-		if bytes.Equal(existingJSON, jsonBytes) {
+		if bytes.Equal(existingPayload, payload) {
 			return false, nil
 		}
-		val := MakeValue(endIP, jsonBytes)
+		val := MakeValue(endIP, payload)
 		if val == nil {
 			return false, fmt.Errorf("invalid end IP")
 		}
-		RecordChange(clDB, key, "overwrite", existingJSON, jsonBytes)
+		RecordChange(clDB, key, "overwrite", PayloadToJSON(existingPayload), PayloadToJSON(payload))
 		return true, batch.Set(key[:], val, nil)
 	}
 
 	if len(fieldsToUpdate) > 0 {
-		merged, changed := MergeFields(existingJSON, jsonBytes, fieldsToUpdate)
+		merged, changed := MergeFields(existingPayload, payload, fieldsToUpdate)
 		if !changed {
 			return false, nil
 		}
@@ -79,19 +79,19 @@ func writeOrUpdate(pdb *pebble.DB, clDB *pebble.DB, batch *pebble.Batch, startIP
 		if val == nil {
 			return false, fmt.Errorf("invalid end IP")
 		}
-		RecordChange(clDB, key, "merge", existingJSON, merged)
+		RecordChange(clDB, key, "merge", PayloadToJSON(existingPayload), PayloadToJSON(merged))
 		return true, batch.Set(key[:], val, nil)
 	}
 
-	if bytes.Equal(existingJSON, jsonBytes) {
+	if bytes.Equal(existingPayload, payload) {
 		return false, nil
 	}
 
-	val := MakeValue(endIP, jsonBytes)
+	val := MakeValue(endIP, payload)
 	if val == nil {
 		return false, fmt.Errorf("invalid end IP")
 	}
-	RecordChange(clDB, key, "update", existingJSON, jsonBytes)
+	RecordChange(clDB, key, "update", PayloadToJSON(existingPayload), PayloadToJSON(payload))
 	return true, batch.Set(key[:], val, nil)
 }
 
@@ -131,6 +131,7 @@ func ImportMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxmind
 			skipped++
 			continue
 		}
+
 		endIP := LastIPInNetwork(network)
 		if endIP == nil {
 			skipped++
@@ -174,17 +175,15 @@ func ImportMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxmind
 			Latitude:  latitude,
 			Longitude: longitude,
 		}
-		jsonBytes, err := json.Marshal(infoMap)
+
+		payload := EncodeFields(&infoMap)
+
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, isUpdate, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
 
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, isUpdate, overwriteFlag, fieldsToUpdate)
-		if err != nil {
-			skipped++
-			continue
-		}
 		if written {
 			count++
 		} else {
@@ -208,6 +207,7 @@ func ImportMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxmind
 		bar.Finish()
 		return count, skipped, fmt.Errorf("遍历 MMDB 出错: %v", err)
 	}
+
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		bar.Finish()
 		return count, skipped, fmt.Errorf("提交最终批次失败: %v", err)
@@ -215,6 +215,7 @@ func ImportMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxmind
 
 	bar.SetCurrent(count + skipped)
 	bar.Finish()
+
 	return count, skipped, nil
 }
 
@@ -253,6 +254,7 @@ func ImportASNOnly(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overwriteFla
 			skipped++
 			continue
 		}
+
 		endIP := LastIPInNetwork(network)
 		if endIP == nil {
 			skipped++
@@ -272,18 +274,15 @@ func ImportASNOnly(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overwriteFla
 		}
 
 		infoMap := IPInfoFields{ISP: isp}
-		jsonBytes, err := json.Marshal(infoMap)
+		payload := EncodeFields(&infoMap)
+
+		fieldsToUpdate := []string{"isp"}
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, true, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
 
-		fieldsToUpdate := []string{"isp"}
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, true, overwriteFlag, fieldsToUpdate)
-		if err != nil {
-			skipped++
-			continue
-		}
 		if written {
 			count++
 		} else {
@@ -307,6 +306,7 @@ func ImportASNOnly(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overwriteFla
 		bar.Finish()
 		return count, skipped, fmt.Errorf("遍历 ASN MMDB 出错: %v", err)
 	}
+
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		bar.Finish()
 		return count, skipped, fmt.Errorf("提交最终批次失败: %v", err)
@@ -314,6 +314,7 @@ func ImportASNOnly(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overwriteFla
 
 	bar.SetCurrent(count + skipped)
 	bar.Finish()
+
 	return count, skipped, nil
 }
 
@@ -346,7 +347,7 @@ func ImportCSV(csvPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxminddb
 	bar.Start()
 
 	for {
-		record, err := csvReader.Read()
+		csvRecord, err := csvReader.Read()
 		if err == io.EOF {
 			break
 		}
@@ -354,13 +355,14 @@ func ImportCSV(csvPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxminddb
 			skipped++
 			continue
 		}
-		if len(record) < 2 {
+
+		if len(csvRecord) < 2 {
 			skipped++
 			continue
 		}
 
-		startIP := net.ParseIP(record[0])
-		endIP := net.ParseIP(record[1])
+		startIP := net.ParseIP(csvRecord[0])
+		endIP := net.ParseIP(csvRecord[1])
 		if startIP == nil || endIP == nil {
 			skipped++
 			continue
@@ -371,20 +373,21 @@ func ImportCSV(csvPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxminddb
 		city := ""
 		latitude := ""
 		longitude := ""
-		if len(record) >= 4 {
-			country = record[3]
+
+		if len(csvRecord) >= 4 {
+			country = csvRecord[3]
 		}
-		if len(record) >= 5 {
-			province = record[4]
+		if len(csvRecord) >= 5 {
+			province = csvRecord[4]
 		}
-		if len(record) >= 6 {
-			city = record[5]
+		if len(csvRecord) >= 6 {
+			city = csvRecord[5]
 		}
-		if len(record) >= 7 {
-			latitude = record[6]
+		if len(csvRecord) >= 7 {
+			latitude = csvRecord[6]
 		}
-		if len(record) >= 8 {
-			longitude = record[7]
+		if len(csvRecord) >= 8 {
+			longitude = csvRecord[7]
 		}
 
 		isp := ""
@@ -400,17 +403,15 @@ func ImportCSV(csvPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxminddb
 			Latitude:  latitude,
 			Longitude: longitude,
 		}
-		jsonBytes, err := json.Marshal(infoMap)
+
+		payload := EncodeFields(&infoMap)
+
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, isUpdate, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
 
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, isUpdate, overwriteFlag, fieldsToUpdate)
-		if err != nil {
-			skipped++
-			continue
-		}
 		if written {
 			count++
 		} else {
@@ -437,6 +438,7 @@ func ImportCSV(csvPath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *maxminddb
 
 	bar.SetCurrent(count + skipped)
 	bar.Finish()
+
 	return count, skipped, nil
 }
 
@@ -524,6 +526,7 @@ func ImportSQLite(sqlitePath string, pdb *pebble.DB, clDB *pebble.DB, asnDB *max
 
 	bar.SetCurrent(count + skipped)
 	bar.Finish()
+
 	return count, skipped, nil
 }
 
@@ -600,17 +603,15 @@ func importSQLiteV4Columns(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB
 			Latitude:  floatToStr(lat),
 			Longitude: floatToStr(lon),
 		}
-		jsonBytes, err := json.Marshal(infoMap)
+
+		payload := EncodeFields(&infoMap)
+
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, isUpdate, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
 
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, isUpdate, overwriteFlag, fieldsToUpdate)
-		if err != nil {
-			skipped++
-			continue
-		}
 		if written {
 			count++
 		} else {
@@ -621,12 +622,14 @@ func importSQLiteV4Columns(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB
 		if processed%10000 == 0 {
 			bar.SetCurrent(processed)
 		}
+
 		if count > 0 && count%int64(BatchSize) == 0 {
 			if err := commitBatchSilent(batch); err != nil {
 				return count, skipped, err
 			}
 		}
 	}
+
 	return count, skipped, nil
 }
 
@@ -640,6 +643,7 @@ func importSQLiteV4JSON(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB *m
 	for rows.Next() {
 		var startInt, endInt int64
 		var infoJSON string
+
 		if err := rows.Scan(&startInt, &endInt, &infoJSON); err != nil {
 			skipped++
 			continue
@@ -648,13 +652,14 @@ func importSQLiteV4JSON(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB *m
 		startIP := buildV4IP(uint32(startInt))
 		endIP := buildV4IP(uint32(endInt))
 
-		jsonBytes := normalizeIPInfoJSON([]byte(infoJSON), asnDB, startIP)
+		payload := normalizeAndEncode([]byte(infoJSON), asnDB, startIP)
 
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, isUpdate, overwriteFlag, fieldsToUpdate)
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, isUpdate, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
+
 		if written {
 			count++
 		} else {
@@ -665,12 +670,14 @@ func importSQLiteV4JSON(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB *m
 		if processed%10000 == 0 {
 			bar.SetCurrent(processed)
 		}
+
 		if count > 0 && count%int64(BatchSize) == 0 {
 			if err := commitBatchSilent(batch); err != nil {
 				return count, skipped, err
 			}
 		}
 	}
+
 	return count, skipped, nil
 }
 
@@ -711,17 +718,15 @@ func importSQLiteV6Columns(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB
 			Latitude:  floatToStr(lat),
 			Longitude: floatToStr(lon),
 		}
-		jsonBytes, err := json.Marshal(infoMap)
+
+		payload := EncodeFields(&infoMap)
+
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, isUpdate, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
 
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, isUpdate, overwriteFlag, fieldsToUpdate)
-		if err != nil {
-			skipped++
-			continue
-		}
 		if written {
 			count++
 		} else {
@@ -732,12 +737,14 @@ func importSQLiteV6Columns(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB
 		if processed%10000 == 0 {
 			bar.SetCurrent(processed)
 		}
+
 		if count > 0 && count%int64(BatchSize) == 0 {
 			if err := commitBatchSilent(batch); err != nil {
 				return count, skipped, err
 			}
 		}
 	}
+
 	return count, skipped, nil
 }
 
@@ -751,6 +758,7 @@ func importSQLiteV6JSON(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB *m
 	for rows.Next() {
 		var startHi, startLo, endHi, endLo int64
 		var infoJSON string
+
 		if err := rows.Scan(&startHi, &startLo, &endHi, &endLo, &infoJSON); err != nil {
 			skipped++
 			continue
@@ -764,13 +772,14 @@ func importSQLiteV6JSON(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB *m
 		binary.BigEndian.PutUint64(endIP[:8], uint64(endHi))
 		binary.BigEndian.PutUint64(endIP[8:16], uint64(endLo))
 
-		jsonBytes := normalizeIPInfoJSON([]byte(infoJSON), asnDB, startIP)
+		payload := normalizeAndEncode([]byte(infoJSON), asnDB, startIP)
 
-		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, jsonBytes, isUpdate, overwriteFlag, fieldsToUpdate)
+		written, err := writeOrUpdate(pdb, clDB, batch, startIP, endIP, payload, isUpdate, overwriteFlag, fieldsToUpdate)
 		if err != nil {
 			skipped++
 			continue
 		}
+
 		if written {
 			count++
 		} else {
@@ -781,19 +790,21 @@ func importSQLiteV6JSON(sqlDB *sql.DB, pdb *pebble.DB, clDB *pebble.DB, asnDB *m
 		if processed%10000 == 0 {
 			bar.SetCurrent(processed)
 		}
+
 		if count > 0 && count%int64(BatchSize) == 0 {
 			if err := commitBatchSilent(batch); err != nil {
 				return count, skipped, err
 			}
 		}
 	}
+
 	return count, skipped, nil
 }
 
-func normalizeIPInfoJSON(raw []byte, asnDB *maxminddb.Reader, ip net.IP) []byte {
+func normalizeAndEncode(raw []byte, asnDB *maxminddb.Reader, ip net.IP) []byte {
 	var rawData map[string]string
 	if err := json.Unmarshal(raw, &rawData); err != nil {
-		return raw
+		return JSONToPayload(raw)
 	}
 
 	isp := rawData["isp"]
@@ -809,19 +820,14 @@ func normalizeIPInfoJSON(raw []byte, asnDB *maxminddb.Reader, ip net.IP) []byte 
 		Latitude:  rawData["latitude"],
 		Longitude: rawData["longitude"],
 	}
-
-	jsonBytes, err := json.Marshal(infoMap)
-	if err != nil {
-		return raw
-	}
-	return jsonBytes
+	return EncodeFields(&infoMap)
 }
 
 type sortedEntry struct {
-	key      [16]byte
-	startIP  net.IP
-	endIP    net.IP
-	jsonData []byte
+	key     [16]byte
+	startIP net.IP
+	endIP   net.IP
+	payload []byte
 }
 
 type sortedEntries []sortedEntry
@@ -863,6 +869,7 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 		if startIP == nil {
 			continue
 		}
+
 		endIP := LastIPInNetwork(network)
 		if endIP == nil {
 			continue
@@ -904,10 +911,8 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 			Latitude:  latitude,
 			Longitude: longitude,
 		}
-		jsonBytes, err := json.Marshal(infoMap)
-		if err != nil {
-			continue
-		}
+
+		payload := EncodeFields(&infoMap)
 
 		key := MakeKey(startIP)
 		startCopy := make(net.IP, 16)
@@ -916,10 +921,10 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 		copy(endCopy, endIP)
 
 		entries = append(entries, sortedEntry{
-			key:      key,
-			startIP:  startCopy,
-			endIP:    endCopy,
-			jsonData: jsonBytes,
+			key:     key,
+			startIP: startCopy,
+			endIP:   endCopy,
+			payload: payload,
 		})
 
 		readCount++
@@ -932,6 +937,7 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 		bar1.Finish()
 		return 0, 0, fmt.Errorf("遍历 MMDB 出错: %v", err)
 	}
+
 	bar1.SetCurrent(readCount)
 	bar1.Finish()
 
@@ -966,9 +972,9 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 		entry := &entries[newIdx]
 
 		if !dbValid {
-			val := MakeValue(entry.endIP, entry.jsonData)
+			val := MakeValue(entry.endIP, entry.payload)
 			if val != nil {
-				RecordChange(clDB, entry.key, "insert", nil, entry.jsonData)
+				RecordChange(clDB, entry.key, "insert", nil, PayloadToJSON(entry.payload))
 				batch.Set(entry.key[:], val, nil)
 				count++
 			}
@@ -989,9 +995,9 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 		cmp := bytes.Compare(entry.key[:], dbKey)
 
 		if cmp < 0 {
-			val := MakeValue(entry.endIP, entry.jsonData)
+			val := MakeValue(entry.endIP, entry.payload)
 			if val != nil {
-				RecordChange(clDB, entry.key, "insert", nil, entry.jsonData)
+				RecordChange(clDB, entry.key, "insert", nil, PayloadToJSON(entry.payload))
 				batch.Set(entry.key[:], val, nil)
 				count++
 			}
@@ -1001,9 +1007,9 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 		} else {
 			dbVal, valErr := iter.ValueAndErr()
 			if valErr != nil || len(dbVal) < 16 {
-				val := MakeValue(entry.endIP, entry.jsonData)
+				val := MakeValue(entry.endIP, entry.payload)
 				if val != nil {
-					RecordChange(clDB, entry.key, "insert", nil, entry.jsonData)
+					RecordChange(clDB, entry.key, "insert", nil, PayloadToJSON(entry.payload))
 					batch.Set(entry.key[:], val, nil)
 					count++
 				}
@@ -1015,13 +1021,13 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 				continue
 			}
 
-			existingJSON := dbVal[16:]
+			existingPayload := dbVal[16:]
 
 			if overwriteFlag {
-				if !bytes.Equal(existingJSON, entry.jsonData) {
-					val := MakeValue(entry.endIP, entry.jsonData)
+				if !bytes.Equal(existingPayload, entry.payload) {
+					val := MakeValue(entry.endIP, entry.payload)
 					if val != nil {
-						RecordChange(clDB, entry.key, "overwrite", existingJSON, entry.jsonData)
+						RecordChange(clDB, entry.key, "overwrite", PayloadToJSON(existingPayload), PayloadToJSON(entry.payload))
 						batch.Set(entry.key[:], val, nil)
 						count++
 					} else {
@@ -1031,11 +1037,11 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 					skipped++
 				}
 			} else if len(fieldsToUpdate) > 0 {
-				merged, changed := MergeFields(existingJSON, entry.jsonData, fieldsToUpdate)
+				merged, changed := MergeFields(existingPayload, entry.payload, fieldsToUpdate)
 				if changed {
 					val := MakeValue(entry.endIP, merged)
 					if val != nil {
-						RecordChange(clDB, entry.key, "merge", existingJSON, merged)
+						RecordChange(clDB, entry.key, "merge", PayloadToJSON(existingPayload), PayloadToJSON(merged))
 						batch.Set(entry.key[:], val, nil)
 						count++
 					} else {
@@ -1045,10 +1051,10 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 					skipped++
 				}
 			} else {
-				if !bytes.Equal(existingJSON, entry.jsonData) {
-					val := MakeValue(entry.endIP, entry.jsonData)
+				if !bytes.Equal(existingPayload, entry.payload) {
+					val := MakeValue(entry.endIP, entry.payload)
 					if val != nil {
-						RecordChange(clDB, entry.key, "update", existingJSON, entry.jsonData)
+						RecordChange(clDB, entry.key, "update", PayloadToJSON(existingPayload), PayloadToJSON(entry.payload))
 						batch.Set(entry.key[:], val, nil)
 						count++
 					} else {
@@ -1058,6 +1064,7 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 					skipped++
 				}
 			}
+
 			newIdx++
 			dbValid = iter.Next()
 		}
@@ -1078,9 +1085,11 @@ func ImportIncrementalMMDB(mmdbPath string, pdb *pebble.DB, clDB *pebble.DB, asn
 	bar2.Finish()
 
 	NekoSection("阶段 3/3: 提交变更")
+
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return count, skipped, fmt.Errorf("提交最终批次失败: %v", err)
 	}
+
 	NekoSuccess(fmt.Sprintf("变更已提交，更新 %d 条，跳过 %d 条", count, skipped))
 
 	return count, skipped, nil
@@ -1109,7 +1118,7 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 	bar1 := NewNekoProgress("读取 ASN", totalEst)
 	bar1.Start()
 
-	entries := make([]asnEntry, 0, 1<<19)
+	asnEntries := make([]asnEntry, 0, 1<<19)
 	var readCount int64
 
 	networks := asnReader.Networks(maxminddb.SkipAliasedNetworks)
@@ -1124,6 +1133,7 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 		if startIP == nil {
 			continue
 		}
+
 		endIP := LastIPInNetwork(network)
 		if endIP == nil {
 			continue
@@ -1146,7 +1156,7 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 		endCopy := make(net.IP, 16)
 		copy(endCopy, endIP)
 
-		entries = append(entries, asnEntry{
+		asnEntries = append(asnEntries, asnEntry{
 			key:     key,
 			startIP: startCopy,
 			endIP:   endCopy,
@@ -1158,31 +1168,33 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 			bar1.SetCurrent(readCount)
 		}
 	}
+
 	if err := networks.Err(); err != nil {
 		bar1.Finish()
 		return 0, 0, fmt.Errorf("遍历 ASN MMDB 出错: %v", err)
 	}
+
 	bar1.SetCurrent(readCount)
 	bar1.Finish()
 
-	Neko(fmt.Sprintf(" 读取完成，共 %d 条有效记录", len(entries)), ColorLavend)
+	Neko(fmt.Sprintf(" 读取完成，共 %d 条有效记录", len(asnEntries)), ColorLavend)
 
 	needSort := false
-	for i := 1; i < len(entries); i++ {
-		if bytes.Compare(entries[i-1].key[:], entries[i].key[:]) > 0 {
+	for i := 1; i < len(asnEntries); i++ {
+		if bytes.Compare(asnEntries[i-1].key[:], asnEntries[i].key[:]) > 0 {
 			needSort = true
 			break
 		}
 	}
 	if needSort {
 		Neko(" 正在排序...", ColorLavend)
-		sort.Slice(entries, func(i, j int) bool {
-			return bytes.Compare(entries[i].key[:], entries[j].key[:]) < 0
+		sort.Slice(asnEntries, func(i, j int) bool {
+			return bytes.Compare(asnEntries[i].key[:], asnEntries[j].key[:]) < 0
 		})
 	}
 
 	NekoSection("阶段 2/3: 双指针归并比较")
-	bar2 := NewNekoProgress("归并比较", int64(len(entries)))
+	bar2 := NewNekoProgress("归并比较", int64(len(asnEntries)))
 	bar2.Start()
 
 	iter, err := pdb.NewIter(nil)
@@ -1197,26 +1209,22 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 
 	var count int64
 	var skipped int64
+
 	fieldsToUpdate := []string{"isp"}
 
 	dbValid := iter.First()
 	newIdx := 0
 
-	for newIdx < len(entries) {
-		entry := &entries[newIdx]
+	for newIdx < len(asnEntries) {
+		entry := &asnEntries[newIdx]
 
 		ispInfo := IPInfoFields{ISP: entry.isp}
-		jsonBytes, jsonErr := json.Marshal(ispInfo)
-		if jsonErr != nil {
-			newIdx++
-			skipped++
-			continue
-		}
+		payload := EncodeFields(&ispInfo)
 
 		if !dbValid {
-			val := MakeValue(entry.endIP, jsonBytes)
+			val := MakeValue(entry.endIP, payload)
 			if val != nil {
-				RecordChange(clDB, entry.key, "insert", nil, jsonBytes)
+				RecordChange(clDB, entry.key, "insert", nil, PayloadToJSON(payload))
 				batch.Set(entry.key[:], val, nil)
 				count++
 			}
@@ -1237,9 +1245,9 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 		cmp := bytes.Compare(entry.key[:], dbKey)
 
 		if cmp < 0 {
-			val := MakeValue(entry.endIP, jsonBytes)
+			val := MakeValue(entry.endIP, payload)
 			if val != nil {
-				RecordChange(clDB, entry.key, "insert", nil, jsonBytes)
+				RecordChange(clDB, entry.key, "insert", nil, PayloadToJSON(payload))
 				batch.Set(entry.key[:], val, nil)
 				count++
 			}
@@ -1249,7 +1257,7 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 		} else {
 			dbVal, valErr := iter.ValueAndErr()
 			if valErr != nil || len(dbVal) < 16 {
-				val := MakeValue(entry.endIP, jsonBytes)
+				val := MakeValue(entry.endIP, payload)
 				if val != nil {
 					batch.Set(entry.key[:], val, nil)
 					count++
@@ -1262,13 +1270,13 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 				continue
 			}
 
-			existingJSON := dbVal[16:]
+			existingPayload := dbVal[16:]
 
 			if overwriteFlag {
-				if !bytes.Equal(existingJSON, jsonBytes) {
-					val := MakeValue(entry.endIP, jsonBytes)
+				if !bytes.Equal(existingPayload, payload) {
+					val := MakeValue(entry.endIP, payload)
 					if val != nil {
-						RecordChange(clDB, entry.key, "overwrite", existingJSON, jsonBytes)
+						RecordChange(clDB, entry.key, "overwrite", PayloadToJSON(existingPayload), PayloadToJSON(payload))
 						batch.Set(entry.key[:], val, nil)
 						count++
 					} else {
@@ -1278,11 +1286,11 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 					skipped++
 				}
 			} else {
-				merged, changed := MergeFields(existingJSON, jsonBytes, fieldsToUpdate)
+				merged, changed := MergeFields(existingPayload, payload, fieldsToUpdate)
 				if changed {
 					val := MakeValue(entry.endIP, merged)
 					if val != nil {
-						RecordChange(clDB, entry.key, "merge", existingJSON, merged)
+						RecordChange(clDB, entry.key, "merge", PayloadToJSON(existingPayload), PayloadToJSON(merged))
 						batch.Set(entry.key[:], val, nil)
 						count++
 					} else {
@@ -1292,6 +1300,7 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 					skipped++
 				}
 			}
+
 			newIdx++
 			dbValid = iter.Next()
 		}
@@ -1308,13 +1317,15 @@ func ImportIncrementalASN(asnPath string, pdb *pebble.DB, clDB *pebble.DB, overw
 		}
 	}
 
-	bar2.SetCurrent(int64(len(entries)))
+	bar2.SetCurrent(int64(len(asnEntries)))
 	bar2.Finish()
 
 	NekoSection("阶段 3/3: 提交变更")
+
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return count, skipped, fmt.Errorf("提交最终批次失败: %v", err)
 	}
+
 	NekoSuccess(fmt.Sprintf("变更已提交，更新 %d 条，跳过 %d 条", count, skipped))
 
 	return count, skipped, nil

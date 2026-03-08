@@ -11,7 +11,9 @@ import (
 	"github.com/Chocola-X/NekoIPinfo/internal/dbgen"
 	"github.com/Chocola-X/NekoIPinfo/internal/handler"
 	"github.com/Chocola-X/NekoIPinfo/internal/logger"
+	"github.com/Chocola-X/NekoIPinfo/internal/resource"
 	"github.com/Chocola-X/NekoIPinfo/internal/sysinfo"
+	"github.com/Chocola-X/NekoIPinfo/internal/version"
 	"github.com/fasthttp/router"
 	"github.com/valyala/fasthttp"
 )
@@ -26,6 +28,16 @@ func main() {
 		dbgen.SetColorEnabled(false)
 	}
 
+	if cfg.ShowVersion {
+		version.PrintVersion()
+		os.Exit(0)
+	}
+
+	if cfg.DoUpdate {
+		version.DoUpdate(cfg.UpdateTarget)
+		return
+	}
+
 	memMode := cfg.MemMode
 	switch memMode {
 	case db.MemModeOff, db.MemModeFast, db.MemModeFull:
@@ -34,17 +46,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	limits := resource.Parse(cfg.MaxMem, cfg.MaxCPU)
+	if limits.IsEnabled() {
+		limits.Apply()
+	}
+
 	dbgen.NekoHeader("NekoIPinfo 服务启动")
 	fmt.Println()
+
+	dbgen.NekoKV("版本", "v"+version.GetCurrent())
 
 	si := sysinfo.Collect()
 	dbgen.NekoKV("CPU", fmt.Sprintf("%s (%d核 %d线程)", si.CPUModelName, si.CPUCores, si.CPUThreads))
 	dbgen.NekoKV("系统内存", fmt.Sprintf("总计 %d MB / 可用 %d MB", si.TotalMemMB, si.AvailMemMB))
 	dbgen.NekoKV("数据库路径", cfg.DBPath)
 	dbgen.NekoKV("数据库大小", fmt.Sprintf("%.1f MB", sysinfo.DatabaseSizeMB(cfg.DBPath)))
+
+	if limits.IsEnabled() {
+		dbgen.NekoKV("资源限制", limits.Summary())
+	}
+
 	fmt.Println()
 
-	store, err := db.Open(cfg.DBPath, memMode)
+	store, err := db.Open(cfg.DBPath, memMode, limits.MemoryBytes)
 	if err != nil {
 		dbgen.NekoError(fmt.Sprintf("无法打开数据库: %v", err))
 		os.Exit(1)
@@ -59,7 +83,7 @@ func main() {
 		dbgen.NekoKV("运行模式", "⚡ 高性能 - 索引驻内存 + LRU 缓存")
 	default:
 		dbgen.NekoKV("运行模式", "♻ 低内存 - Pebble KV 实时查询")
-		dbgen.Neko("   可加 -mem 提速（默认 full 模式），或 -mem=fast 获得均衡性能", dbgen.ColorDim)
+		dbgen.Neko(" 可加 -mem 提速（默认 full 模式），或 -mem=fast 获得均衡性能", dbgen.ColorDim)
 	}
 
 	var asyncLog *logger.AsyncLogger
@@ -91,9 +115,9 @@ func main() {
 	r.GET("/ipinfo", h.IPInfoHandler)
 
 	var finalHandler fasthttp.RequestHandler
-
 	if cfg.EnableStatic {
 		dbgen.NekoKV("静态文件", fmt.Sprintf("已启用 -> %s", cfg.StaticDir))
+
 		fs := &fasthttp.FS{
 			Root:               cfg.StaticDir,
 			IndexNames:         []string{"index.html"},
@@ -103,6 +127,7 @@ func main() {
 			CacheDuration:      10 * time.Minute,
 		}
 		fsHandler := fs.NewRequestHandler()
+
 		finalHandler = func(ctx *fasthttp.RequestCtx) {
 			path := string(ctx.Path())
 			if path == "/ipinfo" {
@@ -115,10 +140,12 @@ func main() {
 		finalHandler = r.Handler
 	}
 
-	serverConcurrency := cpus * 4096
-	if serverConcurrency < 65536 {
+	serverConcurrency := limits.ServerConcurrency(cpus)
+	if !limits.IsEnabled() && serverConcurrency < 65536 {
 		serverConcurrency = 65536
 	}
+
+	reduceMemory := limits.IsEnabled() && limits.MemoryBytes > 0
 
 	addr := fmt.Sprintf(":%s", cfg.Port)
 
@@ -130,7 +157,17 @@ func main() {
 
 	dbgen.NekoSuccess(fmt.Sprintf("API 服务已启动于 %s 喵！", addr))
 	dbgen.NekoKV("最大并发连接", fmt.Sprintf("%d", serverConcurrency))
+	if reduceMemory {
+		dbgen.NekoKV("内存优化", "已启用 ReduceMemoryUsage")
+	}
 	dbgen.NekoFooter()
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if limits.IsEnabled() {
+		limits.StartMonitor(stopCh)
+	}
 
 	server := &fasthttp.Server{
 		Handler:                      finalHandler,
@@ -138,7 +175,7 @@ func main() {
 		MaxRequestBodySize:           512 * 1024,
 		Concurrency:                  serverConcurrency,
 		TCPKeepalive:                 true,
-		ReduceMemoryUsage:            false,
+		ReduceMemoryUsage:            reduceMemory,
 		DisableHeaderNamesNormalizing: true,
 		NoDefaultServerHeader:        true,
 		NoDefaultDate:                true,

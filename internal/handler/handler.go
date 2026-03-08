@@ -16,11 +16,11 @@ import (
 )
 
 var (
-	respInvalidIP   []byte
+	respInvalidIP  []byte
 	respNotFoundMem []byte
-	respNotFoundDB  []byte
-	respQueryError  []byte
-	respSysError    = []byte(`{"code":500,"msg":"系统内部错误","data":null}`)
+	respNotFoundDB []byte
+	respQueryError []byte
+	respSysError   = []byte(`{"code":500,"msg":"系统内部错误","data":null}`)
 
 	successPrefix = []byte(`{"code":200,"msg":"success","data":{"ip":"`)
 	successMiddle = []byte(`",`)
@@ -188,7 +188,6 @@ func isSpecialIP(ipHi, ipLo uint64) bool {
 	if ipHi == 0x0100000000000000 {
 		return true
 	}
-
 	return false
 }
 
@@ -220,18 +219,17 @@ func (h *Handler) getClientIP(ctx *fasthttp.RequestCtx) string {
 }
 
 type infoFields struct {
-	Country   string `json:"country"`
-	Province  string `json:"province"`
-	City      string `json:"city"`
-	ISP       string `json:"isp"`
-	Latitude  string `json:"latitude"`
-	Longitude string `json:"longitude"`
+	Country  string `json:"country"`
+	Province string `json:"province"`
+	City     string `json:"city"`
+	ISP      string `json:"isp"`
 }
 
 func (h *Handler) logAccess(clientIP, targetIP string, code int, infoJSON []byte, latencyUs int64) {
 	if h.Logger == nil {
 		return
 	}
+
 	var country, province, city, isp string
 	if len(infoJSON) > 2 {
 		var f infoFields
@@ -262,10 +260,10 @@ func buildSuccessBody(targetIP string, infoJSON []byte) []byte {
 	buf.B = append(buf.B, successMiddle...)
 	buf.B = append(buf.B, infoJSON[1:]...)
 	buf.B = append(buf.B, successSuffix...)
-
 	result := make([]byte, len(buf.B))
 	copy(result, buf.B)
 	bytebufferpool.Put(buf)
+
 	return result
 }
 
@@ -283,7 +281,6 @@ func (h *Handler) sendSpecial(ctx *fasthttp.RequestCtx, clientIP, targetIP strin
 	buf.B = append(buf.B[:0], specialPrefix...)
 	buf.B = append(buf.B, targetIP...)
 	buf.B = append(buf.B, specialSuffix...)
-
 	body := make([]byte, len(buf.B))
 	copy(body, buf.B)
 	bytebufferpool.Put(buf)
@@ -294,7 +291,9 @@ func (h *Handler) sendSpecial(ctx *fasthttp.RequestCtx, clientIP, targetIP strin
 
 func (h *Handler) IPInfoHandler(ctx *fasthttp.RequestCtx) {
 	start := time.Now()
+
 	clientIP := h.getClientIP(ctx)
+
 	queryIPBytes := ctx.QueryArgs().Peek("ip")
 	targetIP := strings.TrimSpace(string(queryIPBytes))
 	if targetIP == "" {
